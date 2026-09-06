@@ -1,17 +1,25 @@
 import streamlit as st
+
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
+from langchain_community.retrievers import BM25Retriever
+from langchain.retrievers import EnsembleRetriever, ContextualCompressionRetriever
+from langchain.retrievers.document_compressors import CrossEncoderReranker
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_groq import ChatGroq
 from langchain.callbacks.base import BaseCallbackHandler
+
 import datetime
 import os
 
 load_dotenv()
+
 
 # Page config 
 st.set_page_config(
@@ -20,6 +28,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
 
 # Custom CSS
 st.markdown("""
@@ -107,7 +116,6 @@ class StreamHandler(BaseCallbackHandler):
         self.container.markdown(self.text)
 
 
-# Cached embeddings (loads once, reused across sessions)
 @st.cache_resource(show_spinner=False)
 def load_embeddings():
     return HuggingFaceEmbeddings(
@@ -117,9 +125,15 @@ def load_embeddings():
     )
 
 
+@st.cache_resource(show_spinner=False)
+def load_reranker():
+    model = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return CrossEncoderReranker(model=model, top_n=4)  # final k after reranking
+
+
 def get_llm(streaming=False, handler=None):
     return ChatGroq(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         temperature=0.3,
         streaming=streaming,
         callbacks=[handler] if handler else [],
@@ -140,14 +154,34 @@ def extract_pages(pdf_docs):
     return pages, meta
 
 
-def build_vectorstore(pages):
+def build_hybrid_retriever(pages):
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks, metadatas = [], []
     for p in pages:
         for chunk in splitter.split_text(p["text"]):
             chunks.append(chunk)
             metadatas.append({"source": p["source"], "page": p["page"]})
-    return FAISS.from_texts(texts=chunks, embedding=load_embeddings(), metadatas=metadatas)
+    
+    # Dense retriever
+    vectorstore = FAISS.from_texts(texts=chunks, embedding=load_embeddings(), metadatas=metadatas)
+    dense_retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
+
+    # Sparse/lexical retriever — catches exact terms, numbers, names
+    bm25_retriever = BM25Retriever.from_texts(texts=chunks, metadatas=metadatas)
+    bm25_retriever.k = 10
+
+    # Fuse both lists via Reciprocal Rank Fusion handled by EnsembleRetriever
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[bm25_retriever, dense_retriever],
+        weights=[0.4, 0.6]
+    )
+
+    # Re-rank the fused shortlist with a cross-encoder for final precision
+    hybrid_retriever = ContextualCompressionRetriever(
+        base_compressor=load_reranker(),
+        base_retriever=ensemble_retriever,
+    )
+    return hybrid_retriever, vectorstore
 
 
 def summarize_doc(pages, filename):
@@ -158,13 +192,13 @@ def summarize_doc(pages, filename):
     return response.content
 
 
-def build_chain(vectorstore):
+def build_chain(retriever):
     memory = ConversationBufferMemory(
         memory_key="chat_history", return_messages=True, output_key="answer"
     )
     return ConversationalRetrievalChain.from_llm(
         llm=get_llm(),
-        retriever=vectorstore.as_retriever(search_kwargs={"k": 4}),
+        retriever=retriever,
         memory=memory,
         return_source_documents=True,
     )
@@ -213,8 +247,8 @@ with st.sidebar:
             pages, meta = extract_pages(pdf_docs)
             st.session_state.doc_meta = meta
         with st.spinner("Building vector index..."):
-            vs = build_vectorstore(pages)
-            st.session_state.chain = build_chain(vs)
+            retriever, vs = build_hybrid_retriever(pages)
+            st.session_state.chain = build_chain(retriever)
         with st.spinner("Summarising documents..."):
             st.session_state.summaries = {pdf.name: summarize_doc(pages, pdf.name) for pdf in pdf_docs}
         st.session_state.messages = []
@@ -237,13 +271,13 @@ with st.sidebar:
     if st.session_state.messages:
         st.markdown("<div class='divider'></div>", unsafe_allow_html=True)
         st.download_button(
-            "⬇️  Export Chat", export_chat(st.session_state.messages),
+            "⬇️ Export Chat", export_chat(st.session_state.messages),
             file_name=f"scribe_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.md",
             mime="text/markdown", use_container_width=True
         )
 
     if st.session_state.processed:
-        if st.button("🗑  Clear Session", use_container_width=True):
+        if st.button("🗑 Clear Session", use_container_width=True):
             for k in defaults:
                 st.session_state[k] = defaults[k]
             st.rerun()
@@ -257,11 +291,11 @@ if not st.session_state.processed:
     <div class="empty-state">
         <div class="empty-icon">📂</div>
         <div class="empty-title">No documents loaded yet</div>
-        <div class="empty-sub">Upload PDFs in the sidebar and click Analyse to start chatting</div>
+        <div class="empty-sub">Upload PDFs in the sidebar and click `Analyse Documents` to start chatting</div>
     </div>""", unsafe_allow_html=True)
 
 else:
-    # Auto-summaries
+    # Auto-summarize
     for fname, summary in st.session_state.summaries.items():
         short = fname[:40] + "…" if len(fname) > 42 else fname
         st.markdown(f"""
